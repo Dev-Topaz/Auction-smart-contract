@@ -50,6 +50,9 @@ contract Auction is Ownable {
     AuctionInfo[] internal orders;
     uint256[] internal openOrders;
     mapping(uint256 => uint256) internal openOrderToIndex;
+    mapping(uint256 => uint256) internal orderBalances;
+
+    uint256 public gasPricePerToken = 10 ** 16; // 0.01 ETH per token for gas fee reserves
 
     /**
      * @dev MUST emit when a new auction is created in Market.
@@ -84,10 +87,14 @@ contract Auction is Ownable {
      * @dev MUST emit when an order is failed.
      * @dev Only an open auction order can be failed
      * The `_seller` argument MUST be the address of the seller who created the order.
-     * The `_bidder` argument MUST be the address of the bidder who made the bid.
      * The `_orderId` argument MUST be the id of the order failed.
      */
     event OrderFailed(address indexed _seller, uint256 indexed _orderId);
+
+    /**
+     * @dev MUST emit when ERC1155 token is transferred to this contract
+     */
+    event ERC1155TokenReceived(address indexed _operator, address indexed _from, uint256 _id, uint256 _value, bytes _data);
 
     /**
      * @notice Create a new order for auction
@@ -97,14 +104,19 @@ contract Auction is Ownable {
      * @param _minPrice The minimum starting price for bidding on the auction
      * @param _endTime The time for ending the auction
      */
-    function createOrderForAuction(address _tokenContract, uint256 _tokenId, uint256 _tokenCount, uint256 _minPrice, uint256 _endTime) external {
+    function createOrderForAuction(address _tokenContract, uint256 _tokenId, uint256 _tokenCount, uint256 _minPrice, uint256 _endTime) external payable {
         require(IERC1155(_tokenContract).isApprovedForAll(_msgSender(), address(this)), "AuctionOrder: Auction is not approved by seller");
         require(_tokenContract.isContract(), "AuctionOrder: invalid contract address");
         require(_minPrice > 0, "AuctionOrder: price cannot be zero");
         require(IERC1155(_tokenContract).balanceOf(_msgSender(), _tokenId) >= _tokenCount, "AuctionOrder: insufficient tokens");
         require(_endTime > block.timestamp, "AuctionOrder: end time is expired");
+        require(msg.value >= gasPricePerToken * _tokenCount, "AuctionOrder: insufficient ETH for gas fee reserve");
         
         uint256 orderId = _createOrder(_tokenContract, _tokenId, _tokenCount, _minPrice, _endTime);
+        (bool success, ) = payable(address(this)).call{ value: msg.value }("");
+        require(success, "AuctionOrder: failed to send ETH");
+        orderBalances[orderId] += msg.value;
+        
         emit OrderAuction(_msgSender(), orderId, _tokenContract, _tokenId, _tokenCount, _minPrice, _endTime);
     }
 
@@ -132,7 +144,7 @@ contract Auction is Ownable {
      */
     function settleOrder(uint256 _orderId) external payable {
         require(_msgSender() == orders[_orderId].seller, "AuctionSettle: caller is not the seller");
-        require(orders[_orderId].endTime > block.timestamp, "AuctionSettle: auction is not expired");
+        require(orders[_orderId].endTime < block.timestamp, "AuctionSettle: auction is not expired");
         require(orders[_orderId].bidders.length == orders[_orderId].bids.length, "AuctionSettle: bidders and bids length does not match");
 
         if(orders[_orderId].bidCount >= orders[_orderId].tokenCount) {
@@ -140,13 +152,14 @@ contract Auction is Ownable {
             uint256 finalPrice = orders[_orderId].bids[bidCount - orders[_orderId].tokenCount];
             for(uint256 i = 0; i < bidCount; i++) {
                 if(orders[_orderId].bids[i] < finalPrice) {
-                    uint256 refundAmount = orders[_orderId].bids[i];
-                    (bool success, ) = payable(orders[_orderId].bidders[i]).call{ value: refundAmount }("");
-                    require(success, "AuctionSettle: failed to refund ETH");
+                    uint256 refundAmount = orders[_orderId].bids[i] + gasPricePerToken;
+                    payable(orders[_orderId].bidders[i]).transfer(refundAmount);
+                    orderBalances[_orderId] -= refundAmount;
                 } else {
                     uint256 refundAmount = orders[_orderId].bids[i] - finalPrice;
-                    (bool success, ) = payable(orders[_orderId].bidders[i]).call{ value: refundAmount }("");
-                    require(success, "AuctionSettle: failed to refund ETH");
+                    payable(orders[_orderId].bidders[i]).transfer(refundAmount);
+                    orderBalances[_orderId] -= refundAmount;
+                    // Transfer tokens to winners
                     IERC1155(orders[_orderId].tokenContract).safeTransferFrom(address(this), orders[_orderId].bidders[i], orders[_orderId].tokenId, 1, "");
                     orders[_orderId].buyers.push(orders[_orderId].bidders[i]);
                 }
@@ -165,9 +178,11 @@ contract Auction is Ownable {
             emit OrderFilled(orders[_orderId].seller, _orderId, finalPrice);
         } else {
             for(uint256 i = 0; i < orders[_orderId].bidders.length; i++) {
-                (bool success, ) = payable(orders[_orderId].bidders[i]).call{ value: orders[_orderId].bids[i] }("");
-                require(success, "AuctionSettle: failed to refund ETH");
+                uint256 refundAmount = orders[_orderId].bids[i] + gasPricePerToken;
+                payable(orders[_orderId].bidders[i]).transfer(refundAmount);
+                orderBalances[_orderId] -= refundAmount;
             }
+            // Transfer tokens back to seller
             IERC1155(orders[_orderId].tokenContract).safeTransferFrom(address(this), orders[_orderId].seller, orders[_orderId].tokenId, orders[_orderId].tokenCount, "");
 
             orders[_orderId].orderState = 3;
@@ -181,6 +196,12 @@ contract Auction is Ownable {
             openOrders.pop();
 
             emit OrderFailed(orders[_orderId].seller, _orderId);
+        }
+
+        // Withdraw remaining ETH to seller
+        if(orderBalances[_orderId] > 0) {
+            payable(orders[_orderId].seller).transfer(orderBalances[_orderId]);
+            delete orderBalances[_orderId];
         }
     }
 
@@ -215,6 +236,7 @@ contract Auction is Ownable {
     function _bidOrder(uint256 _orderId, uint256 _value) internal {
         (bool success, ) = payable(address(this)).call{ value: _value }("");
         require(success, "BidOrder: failed to send ETH");
+        orderBalances[_orderId] += _value;
         
         orders[_orderId].lastBidder = _msgSender();
         orders[_orderId].lastBid = _value;
@@ -222,5 +244,21 @@ contract Auction is Ownable {
         orders[_orderId].bids.push(_value);
         orders[_orderId].bidCount += 1;
         orders[_orderId].updateTime = block.timestamp;
+    }
+
+    /**
+     * @dev Withdraw ETH from contract
+     * @dev Only owner can withdraw ETH in emergency situation
+     */
+    function withdraw(uint256 amount) external onlyOwner {
+        payable(owner()).transfer(amount);
+    }
+
+    /**
+     * Simple implementation of `ERC1155Receiver` that will allow a contract to hold ERC1155 tokens.
+     */
+    function onERC1155Received(address _operator, address _from, uint256 _id, uint256 _value, bytes memory _data) public returns (bytes4) {
+        emit ERC1155TokenReceived(_operator, _from, _id, _value, _data);
+        return this.onERC1155Received.selector;
     }
 }
